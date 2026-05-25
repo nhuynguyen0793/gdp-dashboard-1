@@ -18,6 +18,9 @@ from folium import Choropleth, GeoJsonTooltip
 from streamlit_folium import st_folium
 import plotly.express as px
 import json
+import unicodedata
+import urllib.parse
+from streamlit_searchbox import st_searchbox
 
 # ── CẤU HÌNH TRANG ────────────────────────────────────────────────
 st.set_page_config(
@@ -97,7 +100,7 @@ DATA_DIR = Path(__file__).parent / "data"
 
 METRIC_CFG = {
     "MatDo":    {"label": "Mật độ dân số (người/km²)", "cmap": "YlOrRd", "fmt": "{:,.0f}"},
-    "DanSo":    {"label": "Dân số (người)",             "cmap": "YlOrRd", "fmt": "{:,.0f}"},
+    "DanSo":    {"label": "Dân số (người)",             "cmap": "Blues",  "fmt": "{:,.0f}"},
     "DienTich": {"label": "Diện tích (km²)",            "cmap": "YlGn",   "fmt": "{:,.2f}"},
 }
 
@@ -109,13 +112,37 @@ def load_geodata():
     for col in ["DanSo", "DienTich", "MatDo"]:
         gdf[col] = pd.to_numeric(gdf[col], errors="coerce")
     gdf["id"] = gdf.index.astype(str)
+
+    # Đọc trường học
+    df_th = pd.read_excel(DATA_DIR / "Truong_Hoc.xlsx")
+    df_th = df_th.rename(columns={
+        df_th.columns[1]: "TenDVHC",
+        df_th.columns[2]: "TenTruong",
+        df_th.columns[3]: "LinkTruong",
+    })[["TenDVHC","TenTruong","LinkTruong"]]
+
+    # Đọc bệnh viện
+    df_bv = pd.read_excel(DATA_DIR / "Benh_Vien.xlsx",
+                          sheet_name=0)
+    df_bv = df_bv.rename(columns={
+        df_bv.columns[1]: "TenDVHC",
+        df_bv.columns[2]: "TenBenhVien",
+        df_bv.columns[3]: "DiaChiBV",
+        df_bv.columns[4]: "LinkBV",
+    })[["TenDVHC","TenBenhVien","DiaChiBV","LinkBV"]]
+
+    # Join vào gdf theo tên phường/xã
+    gdf = gdf.merge(df_th, on="TenDVHC", how="left")
+    gdf = gdf.merge(df_bv, on="TenDVHC", how="left")
     return gdf
 
 @st.cache_data
 def get_geojson_str(_gdf):
     """Cache GeoJSON string — chỉ serialize 1 lần."""
-    return _gdf[["id","TenDVHC","DanSo","DienTich","MatDo","geometry"]]\
-               .to_json(ensure_ascii=False)
+    cols = ["id","TenDVHC","DanSo","DienTich","MatDo",
+            "TenTruong","LinkTruong","TenBenhVien","DiaChiBV","LinkBV","geometry"]
+    cols = [c for c in cols if c in _gdf.columns]
+    return _gdf[cols].to_json(ensure_ascii=False)
 
 gdf = load_geodata()
 geojson_str = get_geojson_str(gdf)
@@ -190,13 +217,20 @@ def make_map(metric: str, focus_name: str) -> folium.Map:
     """
     cfg = METRIC_CFG[metric]
 
+    # Bbox toàn bộ dữ liệu [minx, miny, maxx, maxy]
+    b = gdf.total_bounds
+
     m = folium.Map(
-        location=[10.776, 106.700],
-        zoom_start=11,
+        location=[(b[1]+b[3])/2, (b[0]+b[2])/2],
+        zoom_start=10,
         tiles="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
         attr="© OpenStreetMap © CARTO",
         prefer_canvas=True,
     )
+
+    # Toàn cảnh: fit vừa màn hình theo đúng extent dữ liệu
+    if focus_name == "— Toàn TP. HCM —":
+        m.fit_bounds([[b[1], b[0]], [b[3], b[2]]], padding=[10, 10])
 
     # Choropleth toàn bộ
     Choropleth(
@@ -214,31 +248,212 @@ def make_map(metric: str, focus_name: str) -> folium.Map:
         highlight=False,
     ).add_to(m)
 
-    # Tooltip layer
-    folium.GeoJson(
-        geojson_str,
-        style_function=lambda _: {
-            "fillColor": "transparent",
-            "color":     "transparent",
-            "weight":    0,
-        },
-        highlight_function=lambda _: {
-            "fillColor": "#1a56db",
-            "color":     "#1a56db",
-            "weight":    2,
-            "fillOpacity": 0.12,
-        },
-        tooltip=GeoJsonTooltip(
-            fields=["TenDVHC", "DanSo", "DienTich", "MatDo"],
-            aliases=["Phường/Xã:", "Dân số:", "Diện tích (km²):", "Mật độ (ng/km²):"],
-            localize=True,
-            sticky=True,
-            style=(
-                "font-family:Inter,sans-serif;"
-                "font-size:13px;padding:8px 10px;border-radius:8px;"
+    # ── Tooltip + Popup layer (hover + click) ──
+    def popup_html(props):
+        name     = props.get("TenDVHC", "")
+        dan_so   = props.get("DanSo", "")
+        dien_tich= props.get("DienTich", "")
+        mat_do   = props.get("MatDo", "")
+        truong   = props.get("TenTruong", "") or "Chưa có dữ liệu"
+        link_th  = props.get("LinkTruong", "") or ""
+        benh_vien= props.get("TenBenhVien", "") or "Chưa có dữ liệu"
+        dia_chi  = props.get("DiaChiBV", "") or ""
+        link_bv  = props.get("LinkBV", "") or ""
+
+        try: dan_so_s   = f"{float(dan_so):,.0f}"
+        except: dan_so_s = str(dan_so)
+        try: dien_tich_s = f"{float(dien_tich):,.2f}"
+        except: dien_tich_s = str(dien_tich)
+        try: mat_do_s   = f"{float(mat_do):,.0f}"
+        except: mat_do_s = str(mat_do)
+
+        # Link Google Maps phường/xã
+        maps_link = f"https://www.google.com/maps/search/{urllib.parse.quote(name + ' TP HCM')}"
+
+        truong_html = (
+            f'<a href="{link_th}" target="_blank" style="color:#1a56db;text-decoration:none">'
+            f'📍 {truong}</a>'
+            if link_th else truong
+        )
+        bv_html = (
+            f'<a href="{link_bv}" target="_blank" style="color:#e63946;text-decoration:none">'
+            f'📍 {benh_vien}</a>'
+            if link_bv else benh_vien
+        )
+
+        return f"""
+        <div style="font-family:Inter,sans-serif;min-width:280px;max-width:340px;font-size:12.5px">
+            <div style="background:#1a56db;color:#fff;padding:8px 12px;border-radius:6px 6px 0 0;
+                        font-size:14px;font-weight:700">
+                📍 {name}
+                &nbsp;<a href="{maps_link}" target="_blank"
+                   style="color:#a8d4ff;font-size:11px;font-weight:400">
+                   🗺️ Google Maps</a>
+            </div>
+            <div style="padding:10px 12px;background:#fff;border:1px solid #e0e7ff;
+                        border-top:none;border-radius:0 0 6px 6px">
+
+                <table style="width:100%;border-collapse:collapse;margin-bottom:8px">
+                  <tr style="background:#f0f4ff">
+                    <td style="padding:4px 6px;color:#555;white-space:nowrap">👥 Dân số</td>
+                    <td style="padding:4px 6px;font-weight:600;color:#1a1a2e">{dan_so_s} người</td>
+                  </tr>
+                  <tr>
+                    <td style="padding:4px 6px;color:#555;white-space:nowrap">📐 Diện tích</td>
+                    <td style="padding:4px 6px;font-weight:600;color:#1a1a2e">{dien_tich_s} km²</td>
+                  </tr>
+                  <tr style="background:#f0f4ff">
+                    <td style="padding:4px 6px;color:#555;white-space:nowrap">🏘️ Mật độ</td>
+                    <td style="padding:4px 6px;font-weight:600;color:#1a1a2e">{mat_do_s} ng/km²</td>
+                  </tr>
+                </table>
+
+                <div style="margin-bottom:6px;padding:6px 8px;background:#fffbf0;
+                            border-left:3px solid #f59e0b;border-radius:0 4px 4px 0">
+                    <div style="font-size:10px;color:#92400e;font-weight:600;
+                                text-transform:uppercase;letter-spacing:.05em;margin-bottom:2px">
+                        🏫 Trường học
+                    </div>
+                    <div style="color:#1a1a2e">{truong_html}</div>
+                </div>
+
+                <div style="padding:6px 8px;background:#fff5f5;
+                            border-left:3px solid #e63946;border-radius:0 4px 4px 0">
+                    <div style="font-size:10px;color:#9b1c1c;font-weight:600;
+                                text-transform:uppercase;letter-spacing:.05em;margin-bottom:2px">
+                        🏥 Bệnh viện / Cơ sở y tế
+                    </div>
+                    <div style="color:#1a1a2e;margin-bottom:2px">{bv_html}</div>
+                    {f'<div style="font-size:11px;color:#666">📌 {dia_chi}</div>' if dia_chi else ''}
+                </div>
+            </div>
+        </div>
+        """
+
+    # Google Maps pin icon SVG (inline, dùng lại nhiều chỗ)
+    GMAP_PIN = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="18" viewBox="0 0 24 30" '
+        'style="vertical-align:middle;margin-right:3px">'
+        '<path d="M12 0C7.6 0 4 3.6 4 8c0 6 8 16 8 16s8-10 8-16c0-4.4-3.6-8-8-8z" fill="#EA4335"/>'
+        '<circle cx="12" cy="8" r="3" fill="#fff"/>'
+        '</svg>'
+    )
+
+    # ── Tooltip hiển thị đầy đủ popup khi hover ──
+    def tooltip_html(props):
+        name      = props.get("TenDVHC", "")
+        dan_so    = props.get("DanSo", "")
+        dien_tich = props.get("DienTich", "")
+        mat_do    = props.get("MatDo", "")
+        truong    = props.get("TenTruong", "") or "Chưa có dữ liệu"
+        link_th   = props.get("LinkTruong", "") or ""
+        benh_vien = props.get("TenBenhVien", "") or "Chưa có dữ liệu"
+        dia_chi   = props.get("DiaChiBV", "") or ""
+        link_bv   = props.get("LinkBV", "") or ""
+
+        try: dan_so_s    = f"{float(dan_so):,.0f}"
+        except: dan_so_s = str(dan_so)
+        try: dien_tich_s = f"{float(dien_tich):,.2f}"
+        except: dien_tich_s = str(dien_tich)
+        try: mat_do_s    = f"{float(mat_do):,.0f}"
+        except: mat_do_s = str(mat_do)
+
+        maps_link = f"https://www.google.com/maps/search/{urllib.parse.quote(name + ' TP HCM')}"
+
+        truong_html = (
+            f'<a href="{link_th}" target="_blank" '
+            f'style="color:#1a56db;text-decoration:none">{GMAP_PIN}{truong}</a>'
+            if link_th else truong
+        )
+        bv_html = (
+            f'<a href="{link_bv}" target="_blank" '
+            f'style="color:#e63946;text-decoration:none">{GMAP_PIN}{benh_vien}</a>'
+            if link_bv else benh_vien
+        )
+
+        return f"""
+        <div style="font-family:Inter,sans-serif;width:300px;max-width:300px;
+                    font-size:12.5px;box-sizing:border-box;overflow:hidden">
+            <div style="background:#1a56db;color:#fff;padding:8px 12px;
+                        border-radius:6px 6px 0 0;font-size:13px;font-weight:700;
+                        display:flex;align-items:center;justify-content:space-between;
+                        gap:6px;overflow:hidden">
+                <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">
+                    {GMAP_PIN.replace('fill="#EA4335"','fill="#fff"').replace('fill="#fff"','fill="#1a56db"',1)} {name}
+                </span>
+                <a href="{maps_link}" target="_blank"
+                   style="color:#a8d4ff;font-size:11px;font-weight:400;
+                          white-space:nowrap;flex-shrink:0">
+                   {GMAP_PIN.replace('fill="#EA4335"','fill="#a8d4ff"')} Google Maps
+                </a>
+            </div>
+            <div style="padding:10px 12px;background:#fff;border:1px solid #e0e7ff;
+                        border-top:none;border-radius:0 0 6px 6px;overflow:hidden">
+                <table style="width:100%;border-collapse:collapse;margin-bottom:8px;table-layout:fixed">
+                  <tr style="background:#f0f4ff">
+                    <td style="padding:4px 6px;color:#555;white-space:nowrap;width:95px">👥 Dân số</td>
+                    <td style="padding:4px 6px;font-weight:600;color:#1a1a2e">{dan_so_s} người</td>
+                  </tr>
+                  <tr>
+                    <td style="padding:4px 6px;color:#555;white-space:nowrap">📐 Diện tích</td>
+                    <td style="padding:4px 6px;font-weight:600;color:#1a1a2e">{dien_tich_s} km²</td>
+                  </tr>
+                  <tr style="background:#f0f4ff">
+                    <td style="padding:4px 6px;color:#555;white-space:nowrap">🏘️ Mật độ</td>
+                    <td style="padding:4px 6px;font-weight:600;color:#1a1a2e">{mat_do_s} ng/km²</td>
+                  </tr>
+                </table>
+                <div style="margin-bottom:6px;padding:6px 8px;background:#fffbf0;
+                            border-left:3px solid #f59e0b;border-radius:0 4px 4px 0">
+                    <div style="font-size:10px;color:#92400e;font-weight:600;
+                                text-transform:uppercase;letter-spacing:.05em;margin-bottom:3px">
+                        🏫 Trường học
+                    </div>
+                    <div style="color:#1a1a2e;word-break:break-word">{truong_html}</div>
+                </div>
+                <div style="padding:6px 8px;background:#fff5f5;
+                            border-left:3px solid #e63946;border-radius:0 4px 4px 0">
+                    <div style="font-size:10px;color:#9b1c1c;font-weight:600;
+                                text-transform:uppercase;letter-spacing:.05em;margin-bottom:3px">
+                        🏥 Bệnh viện / Cơ sở y tế
+                    </div>
+                    <div style="color:#1a1a2e;margin-bottom:2px;word-break:break-word">{bv_html}</div>
+                    {f'<div style="font-size:11px;color:#666;word-break:break-word">📌 {dia_chi}</div>' if dia_chi else ''}
+                </div>
+            </div>
+        </div>
+        """
+
+    gj_data = json.loads(geojson_str)
+    for feat in gj_data["features"]:
+        props = feat["properties"]
+        name  = props.get("TenDVHC", "")
+        folium.GeoJson(
+            feat,
+            style_function=lambda _: {
+                "fillColor": "transparent",
+                "color":     "transparent",
+                "weight":    0,
+            },
+            highlight_function=lambda _: {
+                "fillColor": "#1a56db",
+                "color":     "#1a56db",
+                "weight":    2,
+                "fillOpacity": 0.12,
+            },
+            # Hover: chỉ hiện tên phường/xã
+            tooltip=folium.Tooltip(
+                f'<span style="font-family:Inter,sans-serif;font-size:13px;'
+                f'font-weight:700;color:#1a1a2e">{name}</span>',
+                sticky=False,
             ),
-        ),
-    ).add_to(m)
+            # Click: hiện popup đầy đủ
+            popup=folium.Popup(
+                folium.Html(tooltip_html(props), script=True),
+                max_width=320,
+                lazy=True,   # chỉ render khi click — tiết kiệm bộ nhớ
+            ),
+        ).add_to(m)
 
     # ── Highlight + fit_bounds phường được chọn ──
     if focus_name != "— Toàn TP. HCM —":
@@ -253,23 +468,75 @@ def make_map(metric: str, focus_name: str) -> folium.Map:
                 padding=[40, 40],
             )
 
-            # Viền đỏ nổi bật cho polygon được chọn
-            sel_json = sel[["TenDVHC","DanSo","DienTich","MatDo","geometry"]]\
-                          .to_json(ensure_ascii=False)
+            # Viền đỏ nổi bật + tooltip đầy đủ cho polygon được chọn
+            sel_row = gdf[gdf["TenDVHC"] == focus_name].iloc[0]
+            # Dùng pandas để convert numpy types → Python native (int64→int, float64→float)
+            sel_props = (
+                gdf[gdf["TenDVHC"] == focus_name]
+                .drop(columns="geometry")
+                .astype(object)        # ép về object dtype trước
+                .iloc[0]
+                .where(lambda x: x.notna(), other=None)   # NaN → None
+                .to_dict()
+            )
+            sel_feat = {
+                "type": "Feature",
+                "properties": sel_props,
+                "geometry": sel.geometry.iloc[0].__geo_interface__,
+            }
             folium.GeoJson(
-                sel_json,
+                sel_feat,
                 style_function=lambda _: {
-                    "fillColor": "transparent",
+                    "fillColor": "rgba(230,57,70,0.08)",
                     "color":     "#e63946",
                     "weight":    3.5,
-                    "fillOpacity": 0,
+                    "fillOpacity": 0.08,
                     "dashArray": "6 3",
                 },
+                highlight_function=lambda _: {
+                    "fillColor": "rgba(230,57,70,0.15)",
+                    "color":     "#e63946",
+                    "weight":    4,
+                    "fillOpacity": 0.15,
+                },
+                # Popup: mở sẵn, giữ nguyên khi hover — đóng khi click X
+                popup=folium.Popup(
+                    folium.Html(tooltip_html(sel_props), script=True),
+                    max_width=320,
+                    show=True,        # tự mở popup ngay khi load
+                    sticky=True,      # giữ popup khi hover vào trong
+                ),
+                # Tooltip nhẹ khi hover (bổ sung)
+                tooltip=folium.Tooltip(
+                    sel_props.get("TenDVHC", ""),
+                    sticky=False,
+                    style="font-family:Inter,sans-serif;font-size:13px;font-weight:700;color:#e63946",
+                ),
             ).add_to(m)
 
     return m
 
-# ── TIÊU ĐỀ ───────────────────────────────────────────────────────
+# ── HÀM XỬ LÝ KHÔNG DẤU ─────────────────────────────────────────
+def no_accent(text: str) -> str:
+    """'Phường Xuân Hòa' → 'phuong xuan hoa'"""
+    text = unicodedata.normalize("NFD", str(text))
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+    return text.lower().strip()
+
+@st.cache_data
+def build_ward_index(_gdf):
+    names = sorted(_gdf["TenDVHC"].dropna().unique().tolist())
+    names_na = [(n, no_accent(n)) for n in names]
+    return names_na
+
+_names_na = build_ward_index(gdf)
+
+def search_wards(query: str):
+    """Searchbox callback: gõ có dấu hay không dấu đều ra gợi ý tên gốc."""
+    if not query or not query.strip():
+        return []
+    q = no_accent(query)
+    return [n for n, na in _names_na if q in na]
 st.markdown("""
 <p class="page-title">🗺️ Trực quan hóa Dân số TP. Hồ Chí Minh</p>
 <p class="page-sub">Ranh giới <b>168 phường/xã</b> — Dữ liệu địa chính HCMC</p>
@@ -309,7 +576,7 @@ tab_map, tab_charts, tab_rank, tab_data = st.tabs([
 
 # ── TAB BẢN ĐỒ ───────────────────────────────────────────────────
 with tab_map:
-    col_ctrl1, col_ctrl2 = st.columns([2, 2])
+    col_ctrl1, col_ctrl2 = st.columns([3, 2])
     with col_ctrl1:
         metric = st.radio(
             "Tô màu theo chỉ tiêu:",
@@ -322,8 +589,15 @@ with tab_map:
             horizontal=True,
         )
     with col_ctrl2:
-        ward_list = ["— Toàn TP. HCM —"] + sorted(gdf["TenDVHC"].dropna().unique().tolist())
-        focus_name = st.selectbox("🔍 Tìm & zoom đến phường/xã", ward_list)
+        chosen_name = st_searchbox(
+            search_wards,
+            placeholder="Gõ tên phường/xã (có hoặc không dấu)…",
+            label="🔍 Tìm kiếm phường/xã",
+            key="ward_searchbox",
+            clear_on_submit=False,
+        )
+
+    focus_name = chosen_name if chosen_name else "— Toàn TP. HCM —"
 
     # Thông tin phường được chọn
     if focus_name != "— Toàn TP. HCM —":
